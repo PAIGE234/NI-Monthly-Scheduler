@@ -1,0 +1,15 @@
+STREAMLIT DEPLOYMENT FIX
+
+Upload these files to the TOP LEVEL of your GitHub NI-Monthly-Scheduler repository:
+
+- requirements.txt
+- runtime.txt
+
+Keep your existing streamlit_app.py.
+
+The filenames must be exact, with no [1].
+
+After committing, Streamlit should rebuild automatically. If not:
+Manage app -> Reboot app.
+
+This removes fixed package versions and requests Python 3.12 for better compatibility.
