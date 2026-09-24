@@ -128,26 +128,22 @@ def bulk_geocode_postcodes(postcodes):
         return {}
 
 def ors_matrix(points):
-    """Return real ORS road travel durations (hours) and distances (miles)."""
+    """Return a driving-time matrix in hours for [(lat, lon), ...]."""
     key = ors_key()
     if not key:
         raise ValueError("ORS_API_KEY is missing from Streamlit Secrets.")
     locations = [[lon, lat] for lat, lon in points]
     url = "https://api.heigit.org/openrouteservice/v2/matrix/driving-car"
     headers = {"Authorization": key, "Content-Type": "application/json"}
-    payload = {"locations": locations, "metrics": ["duration", "distance"]}
+    payload = {"locations": locations, "metrics": ["duration"], "units": "m"}
     r = requests.post(url, headers=headers, json=payload, timeout=45)
     if r.status_code in (401, 403):
         raise ValueError("OpenRouteService rejected the API key. Check ORS_API_KEY in Streamlit Secrets.")
     r.raise_for_status()
-    data = r.json()
-    durations = data.get("durations")
-    distances = data.get("distances")
-    if not durations or not distances:
-        raise ValueError("OpenRouteService did not return road travel times and distances.")
-    hours = [[None if v is None else v / 3600.0 for v in row] for row in durations]
-    miles = [[None if v is None else v / 1609.344 for v in row] for row in distances]
-    return hours, miles
+    durations = r.json().get("durations")
+    if not durations:
+        raise ValueError("OpenRouteService did not return driving times.")
+    return [[None if v is None else v / 3600.0 for v in row] for row in durations]
 
 def hav(a,b):
     R=6371
@@ -160,34 +156,46 @@ def travel_hours(a,b,road_factor=1.25,avg_mph=45):
     return ((hav(a,b)*road_factor)/1.609344)/avg_mph
 
 def build_travel_lookup(yard, job_coords):
-    """Build real road travel time + mileage lookups between yard and all job postcodes."""
+    """Build real road travel times between yard and all jobs."""
     labels = ["__YARD__"] + list(job_coords.keys())
     pts = [yard] + [job_coords[p] for p in job_coords]
-    hours, miles = ors_matrix(pts)
-    time_lookup, mile_lookup = {}, {}
+    mat = ors_matrix(pts)
+    lookup = {}
     for i, a in enumerate(labels):
         for j, b in enumerate(labels):
-            time_lookup[(a, b)] = hours[i][j]
-            mile_lookup[(a, b)] = miles[i][j]
-    return time_lookup, mile_lookup
-
-def fmt_travel_time(hours):
-    if hours is None:
-        return ""
-    mins = int(round(float(hours) * 60))
-    h, m = divmod(mins, 60)
-    return f"{h} hr {m:02d} min" if h else f"{m} min"
+            lookup[(a, b)] = mat[i][j]
+    return lookup
 
 
-def workdays(year,month,half):
+def workdays(year, month, half, enabled_weekdays=None):
+    """Working dates for a month half using user-selected weekdays."""
+    if enabled_weekdays is None:
+        enabled_weekdays={0,1,2,3,4}
     d=date(year,month,1); out=[]
     while d.month==month:
-        if d.weekday()<5 and ((half==1 and d.day<=16) or (half==2 and d.day>=17)):
+        in_half=(half==1 and d.day<=16) or (half==2 and d.day>=17)
+        if d.weekday() in enabled_weekdays and in_half:
             out.append(d)
         d+=timedelta(days=1)
     return out
 
-def build_schedule(df, cols, teams, men, hours_day, yard_pc):
+def enabled_weekday_set(day_flags):
+    return {i for i, name in enumerate(["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"])
+            if day_flags.get(name, False)}
+
+def planning_dates_between(start_date, end_date, enabled_weekdays):
+    """Inclusive working dates between two dates."""
+    if start_date > end_date:
+        return []
+    out=[]; d=start_date
+    while d<=end_date:
+        if d.weekday() in enabled_weekdays:
+            out.append(d)
+        d+=timedelta(days=1)
+    return out
+
+
+def build_schedule(df, cols, teams, men, hours_day, yard_pc, enabled_weekdays=None):
     jc,sc,pc,dc,hc=[cols[k] for k in ["job","site","postcode","due","hours"]]
     x=df.copy()
     x["_job"]=x[jc].astype(str)
@@ -200,15 +208,15 @@ def build_schedule(df, cols, teams, men, hours_day, yard_pc):
         raise ValueError(f"{len(bad)} job(s) have missing/invalid due date, postcode or hours. Fix these before scheduling.")
     year=int(x["_due"].dt.year.mode().iloc[0]); month=int(x["_due"].dt.month.mode().iloc[0])
     x["_half"]=(x["_due"].dt.day>16).astype(int)+1
-
-    yard_key=re.sub(r"\s+","",str(yard_pc).upper())
-    if yard_key=="ST161BQ":
-        yard=(52.8186,-2.1190)
+    # Permanent NI yard: ST16 1BQ. Built in so scheduling does not depend on
+    # the external postcode service being able to resolve the yard.
+    yard_key = re.sub(r"\s+", "", str(yard_pc).upper())
+    if yard_key == "ST161BQ":
+        yard = (52.8186, -2.1190)
     else:
-        yard=geocode_postcode(yard_pc)
+        yard = geocode_postcode(yard_pc)
     if not yard:
         raise ValueError("Could not locate the yard postcode. Check the postcode or use ST16 1BQ.")
-
     coords={}
     prog=st.progress(0,text="Locating postcodes…")
     pcs=x["_pc"].unique()
@@ -217,139 +225,216 @@ def build_schedule(df, cols, teams, men, hours_day, yard_pc):
         prog.progress((i+1)/len(pcs),text=f"Locating postcodes… {i+1}/{len(pcs)}")
     prog.empty()
     failed=[p for p,v in coords.items() if not v]
-    if failed:
-        raise ValueError("Could not locate postcode(s): "+", ".join(failed[:12]))
-
+    if failed: raise ValueError("Could not locate postcode(s): "+", ".join(failed[:12]))
     x["_coord"]=x["_pc"].map(coords)
     x["_yard_dist"]=x["_coord"].map(lambda c:hav(yard,c))
-
-    with st.spinner("Getting real road mileage and travel times…"):
-        road_time, road_miles = build_travel_lookup(yard, coords)
-
     scheduled=[]
     for half in [1,2]:
         pool=x[x["_half"]==half].sort_values("_yard_dist",ascending=False).copy()
-        days=workdays(year,month,half); day_i=0
+        days=workdays(year,month,half,enabled_weekdays); day_i=0
         while len(pool):
-            if day_i>=len(days):
-                raise ValueError("Not enough working days to fit all jobs.")
+            if day_i>=len(days): raise ValueError("Not enough working days to fit all jobs.")
             day=days[day_i]; used=set()
             for t in range(1,teams+1):
                 avail=pool[~pool.index.isin(used)]
                 if avail.empty: break
-
                 seed=avail.sort_values("_yard_dist",ascending=False).iloc[0]
                 route=[seed.name]
-                first_pc=seed["_pc"]
-                first_leg=road_time.get(("__YARD__",first_pc))
-                if first_leg is None:
-                    raise ValueError(f"No road route returned for yard to {first_pc}.")
-                elapsed=first_leg+seed["_hrs"]/men
-                current_pc=first_pc
-                current_dist=seed["_yard_dist"]
-
+                elapsed=travel_hours(yard,seed["_coord"])+seed["_hrs"]/men
+                current=seed["_coord"]; current_dist=seed["_yard_dist"]
                 while True:
                     cand=pool[(~pool.index.isin(used|set(route)))&(pool["_yard_dist"]<=current_dist+8)]
                     if cand.empty: break
                     cand=cand.copy()
-                    cand["_leg"]=cand["_pc"].map(lambda p: road_time.get((current_pc,p)))
-                    cand=cand[cand["_leg"].notna()].sort_values(["_leg","_yard_dist"],ascending=[True,False])
+                    cand["_leg"]=cand["_coord"].map(lambda c:travel_hours(current,c))
+                    cand=cand.sort_values(["_leg","_yard_dist"],ascending=[True,False])
                     picked=None
                     for idx,r in cand.iterrows():
-                        return_leg=road_time.get((r["_pc"],"__YARD__"))
-                        if return_leg is None: continue
-                        trial=elapsed+r["_leg"]+r["_hrs"]/men+return_leg
+                        trial=elapsed+r["_leg"]+r["_hrs"]/men+travel_hours(r["_coord"],yard)
                         if trial<=hours_day:
                             picked=(idx,r); break
                     if not picked: break
-                    idx,r=picked
-                    route.append(idx)
-                    elapsed+=r["_leg"]+r["_hrs"]/men
-                    current_pc=r["_pc"]
-                    current_dist=r["_yard_dist"]
-
-                return_hours=road_time.get((current_pc,"__YARD__"))
-                return_miles=road_miles.get((current_pc,"__YARD__"))
-                if return_hours is None:
-                    raise ValueError(f"No road route returned from {current_pc} to yard.")
-                elapsed+=return_hours
-
-                prev_pc="__YARD__"
-                total_miles=0.0
-                total_travel_hours=0.0
-                route_rows=[]
+                    idx,r=picked; route.append(idx)
+                    elapsed+=r["_leg"]+(r["_hrs"]*0.80)/men
+                    current=r["_coord"]; current_dist=r["_yard_dist"]
+                elapsed+=travel_hours(current,yard)
                 for order,idx in enumerate(route,1):
                     r=pool.loc[idx]
-                    leg_h=road_time.get((prev_pc,r["_pc"]))
-                    leg_m=road_miles.get((prev_pc,r["_pc"]))
-                    if leg_h is None or leg_m is None:
-                        raise ValueError(f"No road route returned for leg to {r['_pc']}.")
-                    total_miles+=leg_m
-                    total_travel_hours+=leg_h
-                    route_rows.append((order,idx,r,leg_h,leg_m))
-                    prev_pc=r["_pc"]
-
-                total_miles += return_miles or 0
-                total_travel_hours += return_hours
-
-                for order,idx,r,leg_h,leg_m in route_rows:
                     scheduled.append({
                         "Planned Date":day,"Team":f"Team {t}","Route Order":order,
                         "Job Number":r["_job"],"Site Name":r["_site"],"Post Code":r["_pc"],
                         "Due Date":r["_due"].date(),"Contract Hours":float(r["_hrs"]),
-                        "On-Site Hours":round(float(r["_hrs"])/men,2),
-                        "Travel Miles":round(float(leg_m),1),
-                        "Travel Time":fmt_travel_time(leg_h),
-                        "Travel Time Hours":round(float(leg_h),2),
+                        "Team Site Hours":round(float(r["_hrs"])/men,2),
                         "Month Half":"1st Half" if half==1 else "2nd Half",
-                        "Route Day Hours":round(elapsed,2),
-                        "Daily Total Miles":round(total_miles,1),
-                        "Daily Travel Time":fmt_travel_time(total_travel_hours),
-                        "Return to Yard Miles":round(float(return_miles or 0),1),
-                        "Return to Yard Time":fmt_travel_time(return_hours)
+                        "Estimated Route Day Hours":round(elapsed,2)
                     })
                 used.update(route)
             pool=pool.drop(index=list(used)); day_i+=1
     return pd.DataFrame(scheduled).sort_values(["Planned Date","Team","Route Order"])
 
+
+def build_client_planned_dates(df, cols, teams, men, hours_day, yard_pc, start_date, enabled_weekdays):
+    """Create planned dates, then return them in the exact original Excel row order.
+
+    First-half jobs are filled forwards from the selected start date.
+    Second-half jobs are filled backwards from their own due dates.
+    Daily capacity is team elapsed hours: site man-hours / men plus travel.
+    Repeat visits to the same site are spread across available dates where possible.
+    """
+    if not enabled_weekdays:
+        raise ValueError("Turn on at least one working day.")
+
+    jc,sc,pc,dc,hc=[cols[k] for k in ["job","site","postcode","due","hours"]]
+    x=df.copy()
+    x["_orig_order"]=range(len(x))
+    x["_job"]=x[jc].astype(str)
+    x["_site"]=x[sc].astype(str).str.strip()
+    x["_pc"]=x[pc].astype(str).str.upper().str.strip()
+    x["_due"]=pd.to_datetime(x[dc],dayfirst=True,errors="coerce")
+    x["_hrs"]=pd.to_numeric(x[hc],errors="coerce")
+    bad=x[x["_due"].isna()|x["_hrs"].isna()|x["_pc"].isin(["","NAN","NONE"])]
+    if len(bad):
+        raise ValueError(f"{len(bad)} job(s) have missing/invalid due date, postcode or hours.")
+
+    year=int(x["_due"].dt.year.mode().iloc[0]); month=int(x["_due"].dt.month.mode().iloc[0])
+    x["_half"]=(x["_due"].dt.day>16).astype(int)+1
+
+    yard_key=re.sub(r"\s+","",str(yard_pc).upper())
+    yard=(52.8186,-2.1190) if yard_key=="ST161BQ" else geocode_postcode(yard_pc)
+    if not yard:
+        raise ValueError("Could not locate the yard postcode.")
+
+    coords={}
+    prog=st.progress(0,text="Locating postcodes for client dates…")
+    pcs=x["_pc"].unique()
+    for i,p in enumerate(pcs):
+        coords[p]=geocode_postcode(p)
+        prog.progress((i+1)/len(pcs),text=f"Locating postcodes… {i+1}/{len(pcs)}")
+    prog.empty()
+    failed=[p for p,v in coords.items() if not v]
+    if failed:
+        raise ValueError("Could not locate postcode(s): "+", ".join(failed[:12]))
+    x["_coord"]=x["_pc"].map(coords)
+    x["_yard_dist"]=x["_coord"].map(lambda c:hav(yard,c))
+
+    # The client-date planner intentionally uses the same stable travel estimate
+    # as the current operational scheduler, so this feature does not alter route behaviour.
+    def leg(a,b): return travel_hours(a,b)
+
+    assignments={}
+    daily={}  # (date, team) -> {elapsed, current_coord, current_yard_dist, jobs}
+    site_dates={}  # normalized site -> list of assigned dates
+
+    def site_key(row):
+        s=norm(row["_site"])
+        return s if s else norm(row["_pc"])
+
+    def add_to_slot(idx,row,d,t):
+        key=(d,t)
+        slot=daily.setdefault(key,{"elapsed":0.0,"current":yard,"current_dist":10**9,"jobs":[]})
+        travel=leg(slot["current"],row["_coord"]) if slot["jobs"] else leg(yard,row["_coord"])
+        new_elapsed=slot["elapsed"]+travel+(float(row["_hrs"])*0.80)/men
+        # Include return to yard when checking capacity.
+        if new_elapsed+leg(row["_coord"],yard)>hours_day:
+            return False
+        slot["elapsed"]=new_elapsed
+        slot["current"]=row["_coord"]
+        slot["current_dist"]=row["_yard_dist"]
+        slot["jobs"].append(idx)
+        assignments[idx]=d
+        site_dates.setdefault(site_key(row),[]).append(d)
+        return True
+
+    def spread_penalty(row,d):
+        previous=site_dates.get(site_key(row),[])
+        if not previous:
+            return 0
+        # Prefer dates furthest from existing visits to the same site.
+        nearest=min(abs((d-p).days) for p in previous)
+        return -nearest
+
+    month_start=date(year,month,1)
+    first_end=date(year,month,16)
+    # First half: selected start date forwards, but never before the month starts.
+    fh_start=max(start_date,month_start)
+    first_days=planning_dates_between(fh_start,first_end,enabled_weekdays)
+
+    first=x[x["_half"]==1].sort_values(["_due","_yard_dist"],ascending=[True,False])
+    for idx,row in first.iterrows():
+        candidates=[d for d in first_days if d<=row["_due"].date()]
+        candidates=sorted(candidates,key=lambda d:(spread_penalty(row,d),d))
+        placed=False
+        for d in candidates:
+            for t in range(1,teams+1):
+                if add_to_slot(idx,row,d,t):
+                    placed=True; break
+            if placed: break
+        if not placed:
+            raise ValueError(f"Could not fit first-half job {row['_job']} by {row['_due'].date():%d/%m/%Y}.")
+
+    # Second half: each job searches backwards from its own due date.
+    second=x[x["_half"]==2].sort_values(["_due","_yard_dist"],ascending=[False,False])
+    second_floor=max(date(year,month,17), fh_start)
+    for idx,row in second.iterrows():
+        latest=row["_due"].date()
+        candidates=planning_dates_between(second_floor,latest,enabled_weekdays)
+        candidates=sorted(candidates,key=lambda d:(spread_penalty(row,d),-d.toordinal()))
+        placed=False
+        for d in candidates:
+            for t in range(1,teams+1):
+                if add_to_slot(idx,row,d,t):
+                    placed=True; break
+            if placed: break
+        if not placed:
+            raise ValueError(f"Could not fit second-half job {row['_job']} working backwards from {latest:%d/%m/%Y}.")
+
+    result=x[["_orig_order","_job","_site","_pc","_due"]].copy()
+    result["Planned Date"]=result.index.map(assignments)
+    result=result.sort_values("_orig_order")
+    result["Planned Date"]=pd.to_datetime(result["Planned Date"]).dt.date
+    return result.rename(columns={
+        "_job":"Job Number","_site":"Site Name","_pc":"Post Code","_due":"Due Date"
+    })[["Job Number","Site Name","Post Code","Due Date","Planned Date"]]
+
+def make_client_dates_excel(client_dates):
+    """Excel with a copy/paste-friendly Planned Date column in original upload order."""
+    buf=io.BytesIO()
+    with pd.ExcelWriter(buf,engine="openpyxl") as w:
+        client_dates.to_excel(w,index=False,sheet_name="Client Planned Dates")
+        client_dates[["Planned Date"]].to_excel(w,index=False,sheet_name="Paste Planned Dates")
+    return buf.getvalue()
+
 def make_pdf(plan,yard):
     buf=io.BytesIO()
-    doc=SimpleDocTemplate(buf,pagesize=landscape(A4),rightMargin=7*mm,leftMargin=7*mm,topMargin=8*mm,bottomMargin=8*mm)
+    doc=SimpleDocTemplate(buf,pagesize=landscape(A4),rightMargin=10*mm,leftMargin=10*mm,topMargin=9*mm,bottomMargin=9*mm)
     styles=getSampleStyleSheet()
     title=ParagraphStyle("t",parent=styles["Title"],fontSize=18,alignment=TA_CENTER)
     small=ParagraphStyle("s",parent=styles["Normal"],fontSize=8)
-    cell=ParagraphStyle("c",parent=styles["Normal"],fontSize=7.5,leading=8.5)
+    cell=ParagraphStyle("c",parent=styles["Normal"],fontSize=8,leading=9)
     story=[]
     teams=list(plan["Team"].drop_duplicates())
     for ti,team in enumerate(teams):
         story += [Paragraph(f"{team} - Monthly Job List",title),
-                  Paragraph(f"Start/finish yard: {yard} | Travel shown is from the previous stop",small),Spacer(1,4*mm)]
+                  Paragraph(f"Start/finish yard: {yard} | Follow jobs in the order shown",small),Spacer(1,4*mm)]
         for d,g in plan[plan["Team"]==team].groupby("Planned Date",sort=True):
-            g=g.sort_values("Route Order")
             story.append(Paragraph(pd.Timestamp(d).strftime("%A %d/%m/%Y"),styles["Heading2"]))
-            data=[["Done","Order","Job No.","Site","Postcode","Due By","Contract Hrs","On-Site Hrs","Travel Miles","Travel Time"]]
-            for _,r in g.iterrows():
+            data=[["Done","Order","Job No.","Site","Postcode","Due By","Contract Hours"]]
+            for _,r in g.sort_values("Route Order").iterrows():
                 data.append(["☐",str(int(r["Route Order"])),str(r["Job Number"]),Paragraph(str(r["Site Name"]),cell),
-                             str(r["Post Code"]),pd.Timestamp(r["Due Date"]).strftime("%d/%m/%Y"),
-                             f'{r["Contract Hours"]:.2f}',f'{r["On-Site Hours"]:.2f}',f'{r["Travel Miles"]:.1f}',str(r["Travel Time"])])
-            tb=Table(data,colWidths=[9*mm,10*mm,18*mm,61*mm,20*mm,20*mm,20*mm,20*mm,21*mm,25*mm],repeatRows=1)
+                             str(r["Post Code"]),pd.Timestamp(r["Due Date"]).strftime("%d/%m/%Y"),f'{r["Contract Hours"]:.2f}'])
+            tb=Table(data,colWidths=[12*mm,13*mm,23*mm,88*mm,27*mm,27*mm,26*mm],repeatRows=1)
             tb.setStyle(TableStyle([
                 ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#1F4E78")),("TEXTCOLOR",(0,0),(-1,0),colors.white),
-                ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),7.5),
+                ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),8),
                 ("GRID",(0,0),(-1,-1),0.4,colors.HexColor("#AAAAAA")),("VALIGN",(0,0),(-1,-1),"MIDDLE"),
                 ("ALIGN",(0,0),(2,-1),"CENTER"),("ALIGN",(4,1),(-1,-1),"CENTER"),
                 ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#F4F6F8")]),
-                ("TOPPADDING",(0,0),(-1,-1),4),("BOTTOMPADDING",(0,0),(-1,-1),4)]))
-            last=g.iloc[-1]
-            summary=(f'Return to ST16 1BQ: {last["Return to Yard Miles"]:.1f} miles · {last["Return to Yard Time"]}'
-                     f'    |    Daily total: {last["Daily Total Miles"]:.1f} miles · {last["Daily Travel Time"]}'
-                     f'    |    Route day: {last["Route Day Hours"]:.2f} hrs')
-            story += [tb,Spacer(1,2*mm),Paragraph(summary,small),Spacer(1,4*mm)]
+                ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5)]))
+            story += [tb,Spacer(1,4*mm)]
         story += [Paragraph("Notes: ______________________________________________________________________________________________________",small),
                   Spacer(1,3*mm),Paragraph("Operative signature: ____________________________________    Date: ____________________",small)]
         if ti<len(teams)-1: story.append(PageBreak())
-    doc.build(story)
-    return buf.getvalue()
+    doc.build(story); return buf.getvalue()
 
 def make_excel(plan):
     buf=io.BytesIO()
@@ -363,7 +448,15 @@ with st.sidebar:
     men=st.number_input("Men per team",1,10,3)
     hours=st.number_input("Hours per day",4.0,12.0,8.0,0.5)
     yard=st.text_input("Yard postcode","ST16 1BQ")
+    st.subheader("Working days")
+    st.caption("Turn any day on or off. These days apply to both planning functions.")
+    day_flags={}
+    defaults={"Monday":True,"Tuesday":True,"Wednesday":True,"Thursday":True,"Friday":True,"Saturday":False,"Sunday":False}
+    for day_name in defaults:
+        day_flags[day_name]=st.checkbox(day_name,value=defaults[day_name],key=f"workday_{day_name}")
+    enabled_weekdays=enabled_weekday_set(day_flags)
     st.info(f"Capacity: {int(teams)} teams × {int(men)} men × {hours:g} hours")
+    st.caption("Scheduling allowance: jobs use 80% of Contract Hours. Full Contract Hours remain visible in the outputs.")
 
 up=st.file_uploader("Upload monthly Excel sheet",type=["xlsx","xls"])
 st.write("Required information: job number, site, postcode, due date and hours. Common client column names are recognised automatically.")
@@ -396,12 +489,42 @@ if up:
     if unmatched:
         st.warning("Please check the dropdown selection for: "+", ".join(unmatched))
 
+    st.divider()
+    st.subheader("Client planned dates")
+    st.caption("Creates a Planned Date for every uploaded row and returns the dates in the exact same row order for copy/paste back into the client's Excel.")
+    due_preview=pd.to_datetime(df[cols["due"]],dayfirst=True,errors="coerce")
+    valid_due=due_preview.dropna()
+    default_start=valid_due.min().date().replace(day=1) if len(valid_due) else date.today()
+    planning_start=st.date_input("Planning start date",value=default_start,key="client_planning_start")
+    if st.button("Generate client planned dates",type="secondary"):
+        try:
+            client_dates=build_client_planned_dates(
+                df,cols,int(teams),int(men),float(hours),yard,planning_start,enabled_weekdays
+            )
+            st.session_state["client_dates"]=client_dates
+        except Exception as e:
+            st.error(str(e))
+
+    st.divider()
     if st.button("Generate monthly plan",type="primary"):
         try:
-            plan=build_schedule(df,cols,int(teams),int(men),float(hours),yard)
+            plan=build_schedule(df,cols,int(teams),int(men),float(hours),yard,enabled_weekdays)
             st.session_state["plan"]=plan; st.session_state["yard"]=yard
         except Exception as e:
             st.error(str(e))
+
+if "client_dates" in st.session_state:
+    client_dates=st.session_state["client_dates"]
+    st.subheader("Client planned dates — original Excel row order")
+    st.dataframe(client_dates,use_container_width=True)
+    st.download_button(
+        "Download client planned dates",
+        make_client_dates_excel(client_dates),
+        "NI_Client_Planned_Dates.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
+    st.caption("The 'Paste Planned Dates' sheet contains one Planned Date column only, in the exact same row order as the uploaded file.")
 
 if "plan" in st.session_state:
     plan=st.session_state["plan"]
@@ -413,4 +536,4 @@ if "plan" in st.session_state:
     c2.download_button("Download master Excel",make_excel(plan),
                        "NI_Monthly_Master_Schedule.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
-    st.caption("Travel mileage and time are calculated using the connected OpenRouteService road-routing matrix.")
+    st.caption("Prototype travel is estimated from postcode geography. Production version should use a road-routing matrix.")
